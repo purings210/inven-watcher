@@ -61,9 +61,9 @@ ACTIVE_PRESET = "리허설_차원술사"
 #   True  = 점수 컷을 무시하고, 키워드만 맞으면 무조건 디스코드로 전송 (최대 3건)
 #           → 디스코드까지 실제로 도착하는지 확인하는 용도
 #   False = 평소 운영 모드. AI 점수가 기준을 넘는 글만 전송
-#   ★ 검증 끝나면 반드시 False 로 바꾸세요 ★
+#   ★ 검증 완료 → 운영 모드(False) ★
 # ──────────────────────────────────────────────
-TEST_MODE = True
+TEST_MODE = False
 
 # ──────────────────────────────────────────────
 # 설정
@@ -365,7 +365,7 @@ def main():
                 deferred_count += 1
                 continue
 
-            print(f"  → 키워드 매치: {post['title'][:60]}")
+            print(f"  → 키워드 매치 (추천 {post.get('recommend')}): {post['title'][:60]}")
             time.sleep(cfg["request_delay"])
 
             evaluation = None
