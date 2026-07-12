@@ -1,0 +1,41 @@
+name: inven-watcher
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 10분 간격 (실제로는 지연되어 12~20분 간격일 수 있음)
+  workflow_dispatch: {}       # 수동 실행 버튼
+
+permissions:
+  contents: write             # state.json 커밋용
+
+concurrency:
+  group: inven-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install requests beautifulsoup4
+
+      - name: Run watcher
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python inven_watcher.py
+
+      - name: Commit state
+        run: |
+          git config user.name "inven-watcher-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json || true
+          git diff --cached --quiet || git commit -m "chore: update state [skip ci]"
+          git push
