@@ -57,6 +57,15 @@ PRESETS = {
 ACTIVE_PRESET = "리허설_차원술사"
 
 # ──────────────────────────────────────────────
+# 테스트 모드
+#   True  = 점수 컷을 무시하고, 키워드만 맞으면 무조건 디스코드로 전송 (최대 3건)
+#           → 디스코드까지 실제로 도착하는지 확인하는 용도
+#   False = 평소 운영 모드. AI 점수가 기준을 넘는 글만 전송
+#   ★ 검증 끝나면 반드시 False 로 바꾸세요 ★
+# ──────────────────────────────────────────────
+TEST_MODE = True
+
+# ──────────────────────────────────────────────
 # 설정
 # ──────────────────────────────────────────────
 CONFIG = {
@@ -89,9 +98,16 @@ CONFIG = {
     # 첫 실행 시 기존 글을 전부 알림으로 쏟아내지 않도록,
     # 첫 실행에서는 "본 글로 기록만" 하고 알림은 보내지 않는다.
     "first_run_silent": True,
+    # 한 번 실행에서 보낼 수 있는 최대 알림 수 (글 폭주 시 도배 방지).
+    # 상한에 걸린 글은 '본 글'로 기록하지 않으므로 다음 실행에서 다시 처리된다.
+    "max_sends_per_run": 15,
 }
 # 활성 프리셋 병합
 CONFIG.update(PRESETS[ACTIVE_PRESET])
+# 테스트 모드면 점수 컷 해제 + 전송 상한을 3건으로 제한
+if TEST_MODE:
+    CONFIG["min_score"] = {b: 0 for b in CONFIG["boards"]}
+    CONFIG["max_sends_per_run"] = 3
 
 KST = timezone(timedelta(hours=9))
 POST_URL_RE = re.compile(r"/board/lostark/(\d+)/(\d+)")
@@ -270,6 +286,9 @@ def send_discord(webhook_url, post, board_name, evaluation, cfg):
         footer = f"{board_name} · 평가 불가"
         color = 0x95A5A6
 
+    if TEST_MODE:
+        footer = "🧪 테스트 전송 · " + footer
+
     embed = {
         "title": (post["title"] + reco_tag)[:250],
         "url": post["url"],
@@ -306,9 +325,10 @@ def main():
     session.headers.update({"User-Agent": cfg["user_agent"]})
 
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    print(f"=== 인벤 감시 실행 {now} KST (first_run={first_run}) ===")
+    mode_txt = " [테스트 모드: 점수 컷 해제, 최대 3건]" if TEST_MODE else ""
+    print(f"=== 인벤 감시 실행 {now} KST (first_run={first_run}){mode_txt} ===")
 
-    new_count, sent_count = 0, 0
+    new_count, sent_count, deferred_count = 0, 0, 0
     for board_id, board_name in cfg["boards"].items():
         url = cfg["list_url"].format(board_id=board_id)
         try:
@@ -331,14 +351,18 @@ def main():
             key = f"{board_id}:{post['post_id']}"
             if key in state["seen"]:
                 continue
-            state["seen"][key] = {"t": now, "title": post["title"][:80]}
             new_count += 1
 
-            # 첫 실행: 기록만 하고 알림 폭탄 방지
-            if first_run and cfg["first_run_silent"]:
+            matched = any(k in post["title"] for k in cfg["keywords"])
+
+            # 첫 실행이거나 키워드 미매치 → '본 글'로 기록만 하고 종료
+            if (first_run and cfg["first_run_silent"]) or not matched:
+                state["seen"][key] = {"t": now, "title": post["title"][:80]}
                 continue
-            # 키워드 필터
-            if not any(k in post["title"] for k in cfg["keywords"]):
+
+            # 전송 상한 도달 → seen에 기록하지 않고 다음 실행으로 이월(유실 방지)
+            if sent_count >= cfg["max_sends_per_run"]:
+                deferred_count += 1
                 continue
 
             print(f"  → 키워드 매치: {post['title'][:60]}")
@@ -370,6 +394,9 @@ def main():
                 sc = evaluation["score"] if evaluation else "-"
                 print(f"  → 스킵 (점수 {sc} < {min_score}, 추천 {reco})")
 
+            # 평가·전송까지 끝난 글만 '본 글'로 기록
+            state["seen"][key] = {"t": now, "title": post["title"][:80]}
+
     # seen 무한 증식 방지: 5000건 초과 시 오래된 것부터 정리
     if len(state["seen"]) > 5000:
         keys = list(state["seen"].keys())
@@ -378,7 +405,9 @@ def main():
 
     state["initialized"] = True
     save_state(cfg["state_file"], state)
-    print(f"=== 완료: 신규 {new_count}건, 전송 {sent_count}건 ===")
+    mode = " [테스트 모드]" if TEST_MODE else ""
+    tail = f", 이월 {deferred_count}건" if deferred_count else ""
+    print(f"=== 완료{mode}: 신규 {new_count}건, 전송 {sent_count}건{tail} ===")
 
 
 if __name__ == "__main__":
