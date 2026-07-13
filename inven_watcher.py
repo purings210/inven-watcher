@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-inven_watcher.py — 로스트아크 인벤 벨가르딘 공략 글 감시기
+inven_watcher.py — 로스트아크 인벤 다중 주제 감시기 (v2)
 
-동작 흐름:
-  1. 자유게시판 / 팁과 노하우 게시판 목록 페이지를 긁는다
-  2. 이미 본 글(state.json)은 건너뛰고, 신규 글만 키워드 필터
-  3. 키워드 통과 글의 본문을 가져와 Claude API로 스코어링 + 3줄 요약
-  4. 점수가 임계치 이상이면 디스코드 웹훅으로 전송
+v1과의 차이: 하나의 주제만 보던 구조 → 여러 주제를 동시에 감시하는 구조.
+  · 주제(WATCH)마다 게시판 / 키워드 / AI 평가 기준 / 점수 컷 / 디스코드 채널을 따로 갖는다.
+  · 주제를 켜고 끄는 건 enabled 플래그 한 줄.
 
-환경변수(필수):
-  ANTHROPIC_API_KEY   : Claude API 키
-  DISCORD_WEBHOOK_URL : 디스코드 채널 웹훅 URL
+환경변수:
+  ANTHROPIC_API_KEY    : Claude API 키 (필수)
+  DISCORD_WEBHOOK_URL  : 기본 디스코드 웹훅 (필수)
+  DISCORD_WEBHOOK_BM   : 배마 낙원 전용 채널 (선택. 없으면 기본 웹훅으로 감)
 
-주의:
-  - 인벤 콘텐츠는 저작권 보호 대상. 본문 전체를 퍼가지 말고
-    "제목 + 짧은 요약 + 원문 링크"만 전송한다. (이 스크립트의 기본 동작)
-  - 목록 페이지는 주기적으로, 본문은 키워드 통과 글만 개별 요청한다.
+주의: 인벤 콘텐츠는 저작권 보호 대상.
+      본문을 퍼가지 말고 "제목 + 짧은 AI 요약 + 원문 링크"만 전송한다.
 """
 
 import json
@@ -29,98 +26,144 @@ from datetime import datetime, timezone, timedelta
 import requests
 from bs4 import BeautifulSoup
 
-# ──────────────────────────────────────────────
-# 주제 프리셋 — ACTIVE_PRESET 한 줄만 바꾸면 감시 주제가 전환된다
-#   리허설(~8/4): "리허설_차원술사"  →  본작전(8/5~): "본작전_벨가르딘"
-# ──────────────────────────────────────────────
-PRESETS = {
-    # 2026-07-08 출시된 신규 클래스. '시간 관리자' / '공간 검사' 두 각성(깨달음)이 있어
-    # 빌드 글은 클래스명 없이 각성명만 쓰는 경우가 많아 함께 넣는다.
-    "리허설_차원술사": {
+# ══════════════════════════════════════════════════════════════
+#  게시판 ID (웹 검색으로 실제 확인함)
+# ══════════════════════════════════════════════════════════════
+BOARD = {
+    "6271": "자유게시판",
+    "4821": "팁과 노하우",
+    "5342": "배틀마스터",   # 클래스 게시판. 배마 낙원 공략의 본진.
+}
+
+# ══════════════════════════════════════════════════════════════
+#  테스트 모드
+#    True  = 점수 컷 무시, 키워드만 맞으면 전송 (주제당 최대 3건)
+#    False = 운영 모드
+# ══════════════════════════════════════════════════════════════
+TEST_MODE = False
+
+# ══════════════════════════════════════════════════════════════
+#  감시 주제 목록 — enabled 를 켜고 끄면 됩니다
+# ══════════════════════════════════════════════════════════════
+WATCHES = [
+    # ── 리허설 (~8/4). 벨가르딘 켜면 꺼도 됩니다 ──────────────
+    {
+        "name": "차원술사",
+        "enabled": True,
+        "boards": ["6271", "4821"],
         "keywords": ["차원술사", "시간 관리자", "공간 검사"],
+        "min_score": {"6271": 6, "4821": 4},
+        "webhook_env": "DISCORD_WEBHOOK_URL",
         "topic": (
             "신규 클래스 '차원술사' 관련 유용 정보 "
             "(스킬·트라이포드, 각인·세팅, 아크그리드, 딜사이클, 육성 팁, 성능 분석. "
             "각성은 '시간 관리자'와 '공간 검사' 두 가지)"
         ),
     },
-    # 2026-08-05 출시 예정. 정식 명칭 '죽음의 계율자 벨가르딘', 8인 2관문 그림자 레이드.
-    "본작전_벨가르딘": {
-        "keywords": ["벨가르딘", "페투스 안 크라그마"],
+
+    # ── 본작전 (8/5 출시). 그날 enabled 를 True 로 ────────────
+    #   약칭 대응: 직전 레이드 세르카는 노르카/하르카/나르카로 불렸다.
+    #   '가르딘'을 넣으면 벨가르딘/노가르딘/하가르딘/나가르딘을 한 번에 잡는다.
+    {
+        "name": "벨가르딘",
+        "enabled": False,
+        "boards": ["6271", "4821", "5342"],
+        "keywords": ["가르딘", "벨딘", "페투스", "크라그마"],
+        "min_score": {"6271": 6, "4821": 4, "5342": 5},
+        "webhook_env": "DISCORD_WEBHOOK_URL",
         "topic": (
             "'죽음의 계율자 벨가르딘' 레이드 공략 정보 "
-            "(기믹 파훼법, 1·2관문별 팁, 추천 세팅, 트라이 중 검증된 공략. "
+            "(기믹 파훼법, 1·2관문별 팁, 짤패턴, 대난투, 추천 세팅, 트라이 중 검증된 공략. "
             "2관문 보스는 '페투스 안 크라그마')"
         ),
     },
-}
-ACTIVE_PRESET = "리허설_차원술사"
 
-# ──────────────────────────────────────────────
-# 테스트 모드
-#   True  = 점수 컷을 무시하고, 키워드만 맞으면 무조건 디스코드로 전송 (최대 3건)
-#           → 디스코드까지 실제로 도착하는지 확인하는 용도
-#   False = 평소 운영 모드. AI 점수가 기준을 넘는 글만 전송
-#   ★ 검증 완료 → 운영 모드(False) ★
-# ──────────────────────────────────────────────
-TEST_MODE = False
-
-# ──────────────────────────────────────────────
-# 설정
-# ──────────────────────────────────────────────
-CONFIG = {
-    # 감시 대상 게시판: {게시판ID: 표시이름}
-    # 10추/30추 모음은 자유게시판의 필터 뷰이므로 따로 긁지 않는다(중복).
-    # 대신 목록에서 파싱한 추천수로 "🔥10추+" 태그를 붙인다.
-    "boards": {
-        "6271": "자유게시판",
-        "4821": "팁과 노하우",
+    # ── 배마 낙원 증명 랭킹 ───────────────────────────────────
+    #   ★ 세르카 백테스트 결과 반영 후 켤 것 (enabled: True 로)
+    #   ★ 낙원은 '풀 보정' 콘텐츠다. 각인·아크그리드·보석·엘릭서가 전부 미적용이라
+    #     낙원 전용 스킬트리와 유산 세팅만이 유효하다.
+    #     따라서 일반 배마 빌드 공략(초심배마 가이드 등)은 여기서 '무관'으로 처리해야 한다.
+    #     이 구분을 프롬프트에 명시하지 않으면 AI가 엉뚱한 글을 높게 평가한다.
+    {
+        "name": "배마낙원",
+        "enabled": False,
+        "boards": ["5342", "4821"],
+        "keywords": ["낙원", "증명", "보주", "낙원력"],
+        "min_score": {"5342": 5, "4821": 5},
+        "webhook_env": "DISCORD_WEBHOOK_BM",   # 없으면 기본 웹훅으로 자동 폴백
+        "topic": (
+            "'낙원 - 증명' 콘텐츠에서 배틀마스터로 주간 랭킹 상위권에 들기 위한 정보. "
+            "중요: 낙원은 각인·아크 그리드·보석·엘릭서·초월이 전혀 적용되지 않는 '풀 보정' 콘텐츠다. "
+            "따라서 유효한 정보는 [낙원 전용 스킬트리/스킬코드, 유산 세팅과 강화 우선순위, "
+            "보주 선택, 증명 단계별 보스 패턴과 클리어 타임 단축법, 낙원력 올리는 법, 랭킹작 전략]이다. "
+            "반대로 일반 레이드용 각인·아크그리드·보석·초월 세팅 글은 낙원과 무관하므로 낮게 평가하라. "
+            "타 직업 글이라도 전직업 정리본이나 낙원 시스템 자체의 공략이면 유용하다."
+        ),
     },
+]
+
+
+# ══════════════════════════════════════════════════════════════
+#  백테스트/스윕 전용 주제 사전 (backtest.py 가 가져다 씀)
+#  운영 WATCHES 의 topic 을 그대로 재사용해야 실험이 유효하다.
+# ══════════════════════════════════════════════════════════════
+TOPICS = {w["name"]: w["topic"] for w in WATCHES}
+# 직전 그림자 레이드(2026-01-07 출시). 벨가르딘 프롬프트와 구조를 똑같이 맞춘 대조군.
+TOPICS["세르카"] = (
+    "'고통의 마녀, 세르카' 레이드 공략 정보 "
+    "(기믹 파훼법, 1·2관문별 팁, 짤패턴, 대난투, 추천 세팅, 트라이 중 검증된 공략. "
+    "2관문 보스는 '코르부스 툴 라크')"
+)
+
+# ══════════════════════════════════════════════════════════════
+#  공통 설정
+# ══════════════════════════════════════════════════════════════
+CONFIG = {
     "list_url": "https://www.inven.co.kr/board/lostark/{board_id}",
-    # keywords / topic 은 아래에서 ACTIVE_PRESET 값으로 채워진다
-    # 게시판별 최소 점수 (Claude 0~10점). 팁게는 신호가 강하니 낮게.
-    "min_score": {"6271": 6, "4821": 4},
-    # 추천수가 이 값 이상이면 점수 미달이어도 전송 (집단지성 신호)
-    "recommend_override": 10,
-    # 본문을 Claude에 넘길 때 최대 길이(자)
+    "recommend_override": 10,      # 추천 10 이상이면 점수 미달이어도 전송
     "body_max_chars": 4000,
-    # 요청 간 대기(초) — 인벤 서버 예의
     "request_delay": 1.5,
+    "max_sends_per_run": 15,       # 주제별. 초과분은 다음 실행으로 이월(유실 없음)
+    "claude_model": "claude-haiku-4-5-20251001",
+    "claude_max_tokens": 600,
     "user_agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     ),
-    # Claude 설정
-    "claude_model": "claude-haiku-4-5-20251001",
-    "claude_max_tokens": 600,
-    # 상태 파일
     "state_file": os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"),
-    # 첫 실행 시 기존 글을 전부 알림으로 쏟아내지 않도록,
-    # 첫 실행에서는 "본 글로 기록만" 하고 알림은 보내지 않는다.
-    "first_run_silent": True,
-    # 한 번 실행에서 보낼 수 있는 최대 알림 수 (글 폭주 시 도배 방지).
-    # 상한에 걸린 글은 '본 글'로 기록하지 않으므로 다음 실행에서 다시 처리된다.
-    "max_sends_per_run": 15,
 }
-# 활성 프리셋 병합
-CONFIG.update(PRESETS[ACTIVE_PRESET])
-# 테스트 모드면 점수 컷 해제 + 전송 상한을 3건으로 제한
 if TEST_MODE:
-    CONFIG["min_score"] = {b: 0 for b in CONFIG["boards"]}
     CONFIG["max_sends_per_run"] = 3
 
 KST = timezone(timedelta(hours=9))
 POST_URL_RE = re.compile(r"/board/lostark/(\d+)/(\d+)")
 
 
-# ──────────────────────────────────────────────
-# 상태 관리
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  상태 관리 (주제별 seen / 주제별 첫 실행 플래그)
+# ══════════════════════════════════════════════════════════════
 def load_state(path):
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    return {"seen": {}, "initialized": False}
+    if not os.path.exists(path):
+        return {"seen": {}, "initialized": {}}
+    with open(path, encoding="utf-8") as f:
+        state = json.load(f)
+
+    # v1 → v2 마이그레이션.
+    # v1 형식: seen 키가 "6271:123", initialized 가 bool.
+    # 그대로 두면 v2가 전부 '신규 글'로 보고 알림을 쏟아낸다.
+    if isinstance(state.get("initialized"), bool):
+        old_init = state["initialized"]
+        migrated = {}
+        for k, v in state.get("seen", {}).items():
+            # v1 시절 돌던 주제는 '차원술사' 하나뿐이었다
+            migrated[f"차원술사|{k}"] = v
+        state["seen"] = migrated
+        state["initialized"] = {"차원술사": old_init}
+        print("[안내] 상태 파일을 v1 → v2 형식으로 변환했습니다.")
+
+    state.setdefault("seen", {})
+    state.setdefault("initialized", {})
+    return state
 
 
 def save_state(path, state):
@@ -128,13 +171,12 @@ def save_state(path, state):
         json.dump(state, f, ensure_ascii=False, indent=1)
 
 
-# ──────────────────────────────────────────────
-# 인벤 파싱
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  인벤 파싱
+# ══════════════════════════════════════════════════════════════
 def http_get(url, session):
     r = session.get(url, timeout=15)
     r.raise_for_status()
-    # 인코딩 방어: 헤더가 부정확하면 추정 인코딩 사용
     if not r.encoding or r.encoding.lower() in ("iso-8859-1",):
         r.encoding = r.apparent_encoding
     return r.text
@@ -142,10 +184,8 @@ def http_get(url, session):
 
 def parse_board_list(html, board_id):
     """
-    목록 페이지에서 글 목록 추출.
-    CSS 클래스에 의존하지 않고, 글 URL 패턴(/board/lostark/{board}/{post})으로
-    앵커를 전부 수집하는 방어적 방식. 인벤 마크업이 바뀌어도 잘 버틴다.
-    반환: [{post_id, title, url, recommend}, ...]
+    CSS 클래스에 기대지 않고 글 URL 패턴으로 앵커를 수집하는 방어적 파서.
+    인벤 마크업이 바뀌어도 잘 버틴다.
     """
     soup = BeautifulSoup(html, "html.parser")
     posts = {}
@@ -155,13 +195,10 @@ def parse_board_list(html, board_id):
             continue
         post_id = m.group(2)
         title = a.get_text(" ", strip=True)
-        # 제목 끝의 댓글수 표기 "[12]" / "[댓글 12]" 노이즈 제거
-        title = re.sub(r"\s*\[(?:댓글\s*)?\d+\]\s*$", "", title)
+        title = re.sub(r"\s*\[(?:댓글\s*)?\d+\]\s*$", "", title)  # 댓글수 노이즈 제거
         if not title or len(title) < 2:
             continue
 
-        # 추천수 추출 시도: 같은 행(tr) 안에서 추천 관련 셀을 찾는다.
-        # 실패해도 치명적이지 않으므로 None 허용.
         recommend = None
         tr = a.find_parent("tr")
         if tr:
@@ -173,13 +210,12 @@ def parse_board_list(html, board_id):
                         recommend = int(txt)
                         break
 
-        # 같은 글에 여러 앵커가 걸릴 수 있음 → 필드별로 병합
-        if post_id in posts:
-            exist = posts[post_id]
-            if len(title) > len(exist["title"]):
-                exist["title"] = title
-            if exist["recommend"] is None and recommend is not None:
-                exist["recommend"] = recommend
+        if post_id in posts:  # 같은 글에 앵커가 여러 개 → 필드별 병합
+            ex = posts[post_id]
+            if len(title) > len(ex["title"]):
+                ex["title"] = title
+            if ex["recommend"] is None and recommend is not None:
+                ex["recommend"] = recommend
             continue
 
         posts[post_id] = {
@@ -193,52 +229,40 @@ def parse_board_list(html, board_id):
 
 
 def fetch_post_body(url, session):
-    """본문 텍스트 추출. 알려진 컨테이너 후보를 순서대로 시도."""
     html = http_get(url, session)
     soup = BeautifulSoup(html, "html.parser")
-    candidates = [
-        {"id": "powerbbsContent"},
-        {"class_": "articleContent"},
-        {"id": "BoardContent"},
-        {"class_": "contentBody"},
-    ]
-    for sel in candidates:
-        node = soup.find(attrs={"id": sel["id"]}) if "id" in sel else soup.find(class_=sel["class_"])
+    for finder in (
+        lambda s: s.find(id="powerbbsContent"),
+        lambda s: s.find(class_="articleContent"),
+        lambda s: s.find(id="BoardContent"),
+        lambda s: s.find(class_="contentBody"),
+    ):
+        node = finder(soup)
         if node:
             text = node.get_text("\n", strip=True)
             if len(text) > 30:
                 return text
-    # 최후 수단: 페이지 전체 텍스트에서 네비게이션 잡음 이후 부분
     return soup.get_text("\n", strip=True)
 
 
-# ──────────────────────────────────────────────
-# Claude 평가
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  Claude 채점
+# ══════════════════════════════════════════════════════════════
 def claude_evaluate(title, body, api_key, cfg):
-    """
-    반환: {"score": int 0~10, "category": str, "summary": [str, str, str]}
-    실패 시 None (호출부에서 '평가 불가' 처리).
-    """
+    """반환: {"score": 0~10, "category": str, "summary": [3줄]} / 실패 시 None"""
     body = body[: cfg["body_max_chars"]]
     system = (
-        "당신은 로스트아크 공대의 정보 큐레이터입니다. "
-        f"인벤 게시글이 다음 주제에 실질적으로 도움이 되는 정보인지 평가하세요.\n"
+        "당신은 로스트아크 유저의 정보 큐레이터입니다. "
+        "인벤 게시글이 다음 주제에 실질적으로 도움이 되는 정보인지 평가하세요.\n"
         f"주제: {cfg['topic']}\n"
         "점수 기준: 9~10 구체적이고 검증된 핵심 정보, 7~8 유용한 팁·분석, "
         "5~6 부분적으로 유용, 3~4 후기·감상 위주, 0~2 뻘글·어그로·잡담·주제 무관.\n"
+        "본문이 짧아도 핵심 수치나 파훼법이 담겨 있으면 높게 평가하세요. "
+        "길이가 아니라 정보 밀도로 판단합니다.\n"
         "반드시 아래 JSON만 출력하세요. 다른 텍스트, 마크다운 펜스 금지.\n"
         '{"score": <0-10 정수>, "category": "<기믹|공략|세팅|정보|후기|뻘글|기타>", '
         '"summary": ["<핵심1>", "<핵심2>", "<핵심3>"]}'
     )
-    payload = {
-        "model": cfg["claude_model"],
-        "max_tokens": cfg["claude_max_tokens"],
-        "system": system,
-        "messages": [
-            {"role": "user", "content": f"제목: {title}\n\n본문:\n{body}"}
-        ],
-    }
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -247,167 +271,183 @@ def claude_evaluate(title, body, api_key, cfg):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json=payload,
+            json={
+                "model": cfg["claude_model"],
+                "max_tokens": cfg["claude_max_tokens"],
+                "system": system,
+                "messages": [{"role": "user", "content": f"제목: {title}\n\n본문:\n{body}"}],
+            },
             timeout=60,
         )
         r.raise_for_status()
         data = r.json()
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         text = re.sub(r"```(?:json)?|```", "", text).strip()
-        result = json.loads(text)
-        result["score"] = int(result.get("score", 0))
-        result["summary"] = [str(s) for s in result.get("summary", [])][:3]
-        result["category"] = str(result.get("category", "기타"))
-        return result
-    except Exception as e:  # noqa: BLE001 — 평가 실패는 치명적이지 않음
-        print(f"  [경고] Claude 평가 실패: {e}", file=sys.stderr)
+        res = json.loads(text)
+        return {
+            "score": int(res.get("score", 0)),
+            "category": str(res.get("category", "기타")),
+            "summary": [str(s) for s in res.get("summary", [])][:3],
+        }
+    except Exception as e:  # noqa: BLE001
+        print(f"    [경고] Claude 평가 실패: {e}", file=sys.stderr)
         return None
 
 
-# ──────────────────────────────────────────────
-# 디스코드 전송
-# ──────────────────────────────────────────────
-def send_discord(webhook_url, post, board_name, evaluation, cfg):
+# ══════════════════════════════════════════════════════════════
+#  디스코드 전송
+# ══════════════════════════════════════════════════════════════
+def send_discord(webhook_url, post, watch_name, evaluation):
     reco = post.get("recommend")
-    reco_tag = ""
+    tag = ""
     if isinstance(reco, int):
         if reco >= 30:
-            reco_tag = " 🔥30추+"
+            tag = " 🔥30추+"
         elif reco >= 10:
-            reco_tag = " 🔥10추+"
+            tag = " 🔥10추+"
 
+    board_name = BOARD.get(post["board"], "기타")
     if evaluation:
         score = evaluation["score"]
-        desc_lines = [f"• {s}" for s in evaluation["summary"]]
-        footer = f"{board_name} · [{evaluation['category']}] 정보성 {score}/10"
+        desc = "\n".join(f"• {s}" for s in evaluation["summary"])
+        footer = f"[{watch_name}] {board_name} · {evaluation['category']} · 정보성 {score}/10"
         color = 0x2ECC71 if score >= 8 else 0xF1C40F if score >= 6 else 0x95A5A6
     else:
-        desc_lines = ["(AI 요약 실패 — 원문 링크로 직접 확인)"]
-        footer = f"{board_name} · 평가 불가"
+        desc = "(AI 요약 실패 — 원문 링크로 직접 확인)"
+        footer = f"[{watch_name}] {board_name} · 평가 불가"
         color = 0x95A5A6
 
     if TEST_MODE:
-        footer = "🧪 테스트 전송 · " + footer
+        footer = "🧪 테스트 · " + footer
 
     embed = {
-        "title": (post["title"] + reco_tag)[:250],
+        "title": (post["title"] + tag)[:250],
         "url": post["url"],
-        "description": "\n".join(desc_lines)[:2000],
+        "description": desc[:2000],
         "color": color,
         "footer": {"text": footer},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     r = requests.post(webhook_url, json={"embeds": [embed]}, timeout=15)
-    if r.status_code == 429:  # 디스코드 rate limit
-        wait = r.json().get("retry_after", 2)
-        time.sleep(float(wait) + 0.5)
+    if r.status_code == 429:
+        time.sleep(float(r.json().get("retry_after", 2)) + 0.5)
         requests.post(webhook_url, json={"embeds": [embed]}, timeout=15)
     elif r.status_code >= 400:
-        print(f"  [경고] 디스코드 전송 실패 {r.status_code}: {r.text[:200]}", file=sys.stderr)
+        print(f"    [경고] 디스코드 전송 실패 {r.status_code}: {r.text[:150]}", file=sys.stderr)
 
 
-# ──────────────────────────────────────────────
-# 메인
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#  메인
+# ══════════════════════════════════════════════════════════════
 def main():
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
-    if not webhook:
+    default_hook = os.environ.get("DISCORD_WEBHOOK_URL", "")
+    if not default_hook:
         print("[오류] DISCORD_WEBHOOK_URL 환경변수가 없습니다.", file=sys.stderr)
         sys.exit(1)
     if not api_key:
-        print("[경고] ANTHROPIC_API_KEY 없음 → AI 요약 없이 제목+링크만 전송합니다.", file=sys.stderr)
+        print("[경고] ANTHROPIC_API_KEY 없음 → 제목+링크만 전송합니다.", file=sys.stderr)
 
-    cfg = CONFIG
-    state = load_state(cfg["state_file"])
-    first_run = not state.get("initialized", False)
+    cfg_base = CONFIG
+    state = load_state(cfg_base["state_file"])
     session = requests.Session()
-    session.headers.update({"User-Agent": cfg["user_agent"]})
+    session.headers.update({"User-Agent": cfg_base["user_agent"]})
 
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    mode_txt = " [테스트 모드: 점수 컷 해제, 최대 3건]" if TEST_MODE else ""
-    print(f"=== 인벤 감시 실행 {now} KST (first_run={first_run}){mode_txt} ===")
+    active = [w for w in WATCHES if w["enabled"]]
+    mode = " [테스트 모드]" if TEST_MODE else ""
+    print(f"═══ 인벤 감시 {now} KST{mode} ═══")
+    print(f"활성 주제: {', '.join(w['name'] for w in active) or '(없음)'}")
 
-    new_count, sent_count, deferred_count = 0, 0, 0
-    for board_id, board_name in cfg["boards"].items():
-        url = cfg["list_url"].format(board_id=board_id)
-        try:
-            html = http_get(url, session)
-        except Exception as e:  # noqa: BLE001
-            print(f"[오류] {board_name} 목록 요청 실패: {e}", file=sys.stderr)
-            continue
+    list_cache = {}   # 같은 게시판을 여러 주제가 보면 목록은 한 번만 가져온다
+    totals = {"new": 0, "sent": 0, "deferred": 0}
 
-        posts = parse_board_list(html, board_id)
-        if not posts:
-            print(f"[경고] {board_name}: 파싱 결과 0건 — 마크업 변경/차단 여부 확인 필요", file=sys.stderr)
-            # 디버그용 원본 저장 (덮어쓰기)
-            debug_path = os.path.join(os.path.dirname(cfg["state_file"]), f"debug_{board_id}.html")
-            with open(debug_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            continue
+    for watch in active:
+        wname = watch["name"]
+        first_run = not state["initialized"].get(wname, False)
+        hook = os.environ.get(watch["webhook_env"], "") or default_hook
+        if watch["webhook_env"] != "DISCORD_WEBHOOK_URL" and not os.environ.get(watch["webhook_env"]):
+            print(f"\n[{wname}] {watch['webhook_env']} 미설정 → 기본 채널로 전송합니다.")
 
-        print(f"{board_name}: 목록 {len(posts)}건")
-        for post in posts:
-            key = f"{board_id}:{post['post_id']}"
-            if key in state["seen"]:
-                continue
-            new_count += 1
+        cfg = dict(cfg_base)
+        cfg["topic"] = watch["topic"]
 
-            matched = any(k in post["title"] for k in cfg["keywords"])
+        print(f"\n── [{wname}] {'첫 실행(기록만, 알림 없음)' if first_run else '운영'} ──")
+        sent = 0
 
-            # 첫 실행이거나 키워드 미매치 → '본 글'로 기록만 하고 종료
-            if (first_run and cfg["first_run_silent"]) or not matched:
-                state["seen"][key] = {"t": now, "title": post["title"][:80]}
-                continue
-
-            # 전송 상한 도달 → seen에 기록하지 않고 다음 실행으로 이월(유실 방지)
-            if sent_count >= cfg["max_sends_per_run"]:
-                deferred_count += 1
-                continue
-
-            print(f"  → 키워드 매치 (추천 {post.get('recommend')}): {post['title'][:60]}")
-            time.sleep(cfg["request_delay"])
-
-            evaluation = None
-            if api_key:
+        for board_id in watch["boards"]:
+            if board_id not in list_cache:
                 try:
-                    body = fetch_post_body(post["url"], session)
+                    html = http_get(cfg["list_url"].format(board_id=board_id), session)
+                    list_cache[board_id] = parse_board_list(html, board_id)
+                    time.sleep(cfg["request_delay"])
                 except Exception as e:  # noqa: BLE001
-                    print(f"  [경고] 본문 요청 실패: {e}", file=sys.stderr)
-                    body = ""
-                if body:
-                    evaluation = claude_evaluate(post["title"], body, api_key, cfg)
+                    print(f"  [오류] {BOARD.get(board_id)} 목록 실패: {e}", file=sys.stderr)
+                    list_cache[board_id] = []
+            posts = list_cache[board_id]
 
-            # 전송 판정
-            min_score = cfg["min_score"].get(board_id, 6)
-            reco = post.get("recommend") or 0
-            should_send = (
-                evaluation is None  # 평가 불가 → 사람이 직접 판단하도록 일단 전송
-                or evaluation["score"] >= min_score
-                or reco >= cfg["recommend_override"]
-            )
-            if should_send:
-                send_discord(webhook, post, board_name, evaluation, cfg)
-                sent_count += 1
-                time.sleep(1)
-            else:
-                sc = evaluation["score"] if evaluation else "-"
-                print(f"  → 스킵 (점수 {sc} < {min_score}, 추천 {reco})")
+            if not posts:
+                print(f"  [경고] {BOARD.get(board_id)}: 파싱 0건 — 차단/구조변경 확인 필요", file=sys.stderr)
+                continue
+            print(f"  {BOARD.get(board_id)}: 목록 {len(posts)}건")
 
-            # 평가·전송까지 끝난 글만 '본 글'로 기록
-            state["seen"][key] = {"t": now, "title": post["title"][:80]}
+            for post in posts:
+                key = f"{wname}|{board_id}:{post['post_id']}"
+                if key in state["seen"]:
+                    continue
+                totals["new"] += 1
 
-    # seen 무한 증식 방지: 5000건 초과 시 오래된 것부터 정리
-    if len(state["seen"]) > 5000:
+                matched = any(k in post["title"] for k in watch["keywords"])
+
+                # 첫 실행이거나 키워드 미매치 → 기록만
+                if first_run or not matched:
+                    state["seen"][key] = {"t": now, "title": post["title"][:80]}
+                    continue
+
+                # 전송 상한 → seen에 넣지 않고 다음 실행으로 이월 (유실 방지)
+                if sent >= cfg["max_sends_per_run"]:
+                    totals["deferred"] += 1
+                    continue
+
+                print(f"    → 매치 (추천 {post.get('recommend')}): {post['title'][:50]}")
+                time.sleep(cfg["request_delay"])
+
+                ev = None
+                if api_key:
+                    try:
+                        body = fetch_post_body(post["url"], session)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"    [경고] 본문 실패: {e}", file=sys.stderr)
+                        body = ""
+                    if body:
+                        ev = claude_evaluate(post["title"], body, api_key, cfg)
+
+                cut = 0 if TEST_MODE else watch["min_score"].get(board_id, 6)
+                reco = post.get("recommend") or 0
+                should = (ev is None) or ev["score"] >= cut or reco >= cfg["recommend_override"]
+
+                if should:
+                    send_discord(hook, post, wname, ev)
+                    sent += 1
+                    totals["sent"] += 1
+                    time.sleep(1)
+                else:
+                    print(f"    → 스킵 (점수 {ev['score']} < {cut}, 추천 {reco})")
+
+                state["seen"][key] = {"t": now, "title": post["title"][:80]}
+
+        state["initialized"][wname] = True
+        print(f"  [{wname}] 전송 {sent}건")
+
+    # seen 무한 증식 방지
+    if len(state["seen"]) > 8000:
         keys = list(state["seen"].keys())
-        for k in keys[: len(keys) - 4000]:
+        for k in keys[: len(keys) - 6000]:
             del state["seen"][k]
 
-    state["initialized"] = True
-    save_state(cfg["state_file"], state)
-    mode = " [테스트 모드]" if TEST_MODE else ""
-    tail = f", 이월 {deferred_count}건" if deferred_count else ""
-    print(f"=== 완료{mode}: 신규 {new_count}건, 전송 {sent_count}건{tail} ===")
+    save_state(cfg_base["state_file"], state)
+    tail = f", 이월 {totals['deferred']}건" if totals["deferred"] else ""
+    print(f"\n═══ 완료: 신규 {totals['new']}건, 전송 {totals['sent']}건{tail} ═══")
 
 
 if __name__ == "__main__":
