@@ -65,9 +65,8 @@ def load_urls(path):
     return items
 
 
-def fetch_title(url, session):
-    """글 제목 추출. <title> 태그에서 인벤 접두/접미사를 벗겨낸다."""
-    html = http_get(url, session)
+def fetch_title(html):
+    """글 제목 추출. <title> 태그에서 인벤 접두/접미사를 벗겨낸다. (이미 받은 HTML 재사용)"""
     soup = BeautifulSoup(html, "html.parser")
 
     # og:title 우선
@@ -107,9 +106,9 @@ def main():
         board_name = BOARD_NAMES.get(board, "기타")
 
         try:
-            title = fetch_title(item["url"], session)
-            time.sleep(cfg["request_delay"])
-            content = fetch_post_body(item["url"], session)
+            html = http_get(item["url"], session)   # 글 1개당 요청 1번만
+            title = fetch_title(html)
+            content = fetch_post_body(item["url"], session, html=html)
         except Exception as e:  # noqa: BLE001
             print(f"[{i:2}] 요청 실패: {e}", file=sys.stderr)
             rows.append({**item, "board": board, "board_name": board_name,
@@ -137,7 +136,7 @@ def main():
                      "score": score, "category": cat, "cut": cut,
                      "passed": ok, "media": media,
                      "body_len": len(body)})
-        time.sleep(1)
+        time.sleep(3)
 
     # ── 리포트 ──────────────────────────────────────────
     scored = [r for r in rows if r.get("score") is not None]

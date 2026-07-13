@@ -174,12 +174,26 @@ def save_state(path, state):
 # ══════════════════════════════════════════════════════════════
 #  인벤 파싱
 # ══════════════════════════════════════════════════════════════
-def http_get(url, session):
-    r = session.get(url, timeout=15)
-    r.raise_for_status()
-    if not r.encoding or r.encoding.lower() in ("iso-8859-1",):
-        r.encoding = r.apparent_encoding
-    return r.text
+def http_get(url, session, retries=3):
+    """타임아웃·일시 차단에 대비한 재시도(3회, 점증 대기) 포함 GET."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=20)
+            r.raise_for_status()
+            if not r.encoding or r.encoding.lower() in ("iso-8859-1",):
+                r.encoding = r.apparent_encoding
+            return r.text
+        except requests.exceptions.HTTPError:
+            raise  # 404 등은 재시도해도 소용없음
+        except Exception as e:  # noqa: BLE001 — 타임아웃, 연결 끊김 등
+            last_err = e
+            if attempt < retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f"    [재시도 {attempt+1}/{retries-1}] {wait}초 대기 후 재요청: {url[-30:]}",
+                      file=sys.stderr)
+                time.sleep(wait)
+    raise last_err
 
 
 def parse_board_list(html, board_id):
@@ -228,13 +242,15 @@ def parse_board_list(html, board_id):
     return list(posts.values())
 
 
-def fetch_post_body(url, session):
+def fetch_post_body(url, session, html=None):
     """본문 텍스트 + 미디어 정보 추출.
     반환: {"text": str, "images": int, "videos": int}
+    html 을 넘기면 재요청 없이 그것을 파싱한다 (요청 수 절약).
     이미지·움짤·영상 위주 공략글(로아 공략의 주류 포맷)은 텍스트가 거의 없어서
     텍스트만 보면 AI가 '내용 없음'으로 오판한다. 미디어 개수를 함께 넘겨 보정한다.
     """
-    html = http_get(url, session)
+    if html is None:
+        html = http_get(url, session)
     soup = BeautifulSoup(html, "html.parser")
     node = None
     for finder in (
