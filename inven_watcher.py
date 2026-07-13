@@ -229,8 +229,14 @@ def parse_board_list(html, board_id):
 
 
 def fetch_post_body(url, session):
+    """본문 텍스트 + 미디어 정보 추출.
+    반환: {"text": str, "images": int, "videos": int}
+    이미지·움짤·영상 위주 공략글(로아 공략의 주류 포맷)은 텍스트가 거의 없어서
+    텍스트만 보면 AI가 '내용 없음'으로 오판한다. 미디어 개수를 함께 넘겨 보정한다.
+    """
     html = http_get(url, session)
     soup = BeautifulSoup(html, "html.parser")
+    node = None
     for finder in (
         lambda s: s.find(id="powerbbsContent"),
         lambda s: s.find(class_="articleContent"),
@@ -238,19 +244,38 @@ def fetch_post_body(url, session):
         lambda s: s.find(class_="contentBody"),
     ):
         node = finder(soup)
-        if node:
-            text = node.get_text("\n", strip=True)
-            if len(text) > 30:
-                return text
-    return soup.get_text("\n", strip=True)
+        if node and len(node.get_text(strip=True)) >= 0:
+            break
+    scope = node if node else soup
+
+    images = len(scope.find_all("img"))
+    videos = 0
+    for tag in scope.find_all(["a", "iframe"]):
+        target = (tag.get("href") or tag.get("src") or "")
+        if any(v in target for v in ("youtu.be", "youtube.com", "chzzk", "sooplive", "afreeca")):
+            videos += 1
+    # 본문 밖 텍스트에 섞인 영상 링크도 잡는다 (인벤은 링크를 평문으로 쓰는 경우가 많음)
+    text = scope.get_text("\n", strip=True)
+    if videos == 0:
+        videos = len(re.findall(r"youtu\.?be|youtube\.com/watch", text))
+
+    return {"text": text, "images": images, "videos": videos}
 
 
 # ══════════════════════════════════════════════════════════════
 #  Claude 채점
 # ══════════════════════════════════════════════════════════════
-def claude_evaluate(title, body, api_key, cfg):
+def claude_evaluate(title, body, api_key, cfg, media=None):
     """반환: {"score": 0~10, "category": str, "summary": [3줄]} / 실패 시 None"""
     body = body[: cfg["body_max_chars"]]
+    media_note = ""
+    if media and (media.get("images", 0) > 0 or media.get("videos", 0) > 0):
+        media_note = (
+            f"\n\n[참고] 이 글에는 이미지 {media.get('images', 0)}장, "
+            f"동영상 링크 {media.get('videos', 0)}개가 포함되어 있으나 당신은 텍스트만 볼 수 있습니다. "
+            "제목이 공략·팁·정리를 표방하고 이미지·영상이 다수라면 미디어 위주 공략일 가능성을 고려해 "
+            "텍스트 부족만으로 낮은 점수를 주지 마세요."
+        )
     system = (
         "당신은 로스트아크 유저의 정보 큐레이터입니다. "
         "인벤 게시글이 다음 주제에 실질적으로 도움이 되는 정보인지 평가하세요.\n"
@@ -275,7 +300,7 @@ def claude_evaluate(title, body, api_key, cfg):
                 "model": cfg["claude_model"],
                 "max_tokens": cfg["claude_max_tokens"],
                 "system": system,
-                "messages": [{"role": "user", "content": f"제목: {title}\n\n본문:\n{body}"}],
+                "messages": [{"role": "user", "content": f"제목: {title}\n\n본문:\n{body}{media_note}"}],
             },
             timeout=60,
         )
@@ -297,7 +322,7 @@ def claude_evaluate(title, body, api_key, cfg):
 # ══════════════════════════════════════════════════════════════
 #  디스코드 전송
 # ══════════════════════════════════════════════════════════════
-def send_discord(webhook_url, post, watch_name, evaluation):
+def send_discord(webhook_url, post, watch_name, evaluation, media_rescue=None):
     reco = post.get("recommend")
     tag = ""
     if isinstance(reco, int):
@@ -307,7 +332,19 @@ def send_discord(webhook_url, post, watch_name, evaluation):
             tag = " 🔥10추+"
 
     board_name = BOARD.get(post["board"], "기타")
-    if evaluation:
+    if media_rescue:
+        # 이미지·영상 위주 공략 — 텍스트 채점이 무의미해 점수 대신 미디어 정보를 표시
+        parts = []
+        if media_rescue.get("images"):
+            parts.append(f"이미지 {media_rescue['images']}장")
+        if media_rescue.get("videos"):
+            parts.append(f"영상 {media_rescue['videos']}개")
+        desc = "📷 이미지·영상 위주 공략으로 보임 (" + ", ".join(parts) + ") — 링크에서 직접 확인"
+        if evaluation and evaluation["summary"]:
+            desc += "\n" + "\n".join(f"• {s}" for s in evaluation["summary"])
+        footer = f"[{watch_name}] {board_name} · 📷 미디어 공략"
+        color = 0x3498DB
+    elif evaluation:
         score = evaluation["score"]
         desc = "\n".join(f"• {s}" for s in evaluation["summary"])
         footer = f"[{watch_name}] {board_name} · {evaluation['category']} · 정보성 {score}/10"
@@ -412,22 +449,29 @@ def main():
                 print(f"    → 매치 (추천 {post.get('recommend')}): {post['title'][:50]}")
                 time.sleep(cfg["request_delay"])
 
-                ev = None
+                ev, media = None, None
                 if api_key:
                     try:
-                        body = fetch_post_body(post["url"], session)
+                        content = fetch_post_body(post["url"], session)
                     except Exception as e:  # noqa: BLE001
                         print(f"    [경고] 본문 실패: {e}", file=sys.stderr)
-                        body = ""
-                    if body:
-                        ev = claude_evaluate(post["title"], body, api_key, cfg)
+                        content = None
+                    if content:
+                        media = {"images": content["images"], "videos": content["videos"]}
+                        if content["text"]:
+                            ev = claude_evaluate(post["title"], content["text"], api_key, cfg, media)
 
                 cut = 0 if TEST_MODE else watch["min_score"].get(board_id, 6)
                 reco = post.get("recommend") or 0
-                should = (ev is None) or ev["score"] >= cut or reco >= cfg["recommend_override"]
+                # 미디어 구제: 이미지·영상 위주 공략은 텍스트 채점이 무의미하므로
+                # 점수와 무관하게 전송한다 (단, AI가 0~1점 = 완전 무관 판정이면 제외).
+                media_guide = bool(media) and (media["images"] >= 5 or media["videos"] >= 1) \
+                    and (ev is None or ev["score"] >= 2)
+                should = (ev is None) or ev["score"] >= cut \
+                    or reco >= cfg["recommend_override"] or media_guide
 
                 if should:
-                    send_discord(hook, post, wname, ev)
+                    send_discord(hook, post, wname, ev, media if media_guide else None)
                     sent += 1
                     totals["sent"] += 1
                     time.sleep(1)

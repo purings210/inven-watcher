@@ -109,34 +109,33 @@ def main():
         try:
             title = fetch_title(item["url"], session)
             time.sleep(cfg["request_delay"])
-            body = fetch_post_body(item["url"], session)
+            content = fetch_post_body(item["url"], session)
         except Exception as e:  # noqa: BLE001
             print(f"[{i:2}] 요청 실패: {e}", file=sys.stderr)
             rows.append({**item, "board": board, "board_name": board_name,
                          "title": "(요청 실패)", "score": None, "category": "-"})
             continue
 
-        if not body or len(body) < 20:
-            print(f"[{i:2}] 본문 추출 실패: {title[:40]}", file=sys.stderr)
-            rows.append({**item, "board": board, "board_name": board_name,
-                         "title": title, "score": None, "category": "-"})
-            continue
-
-        ev = claude_evaluate(title, body, api_key, cfg)
+        body = content["text"]
+        media = {"images": content["images"], "videos": content["videos"]}
+        ev = claude_evaluate(title, body, api_key, cfg, media)
         score = ev["score"] if ev else None
         cat = ev["category"] if ev else "-"
         summary = ev["summary"] if ev else []
 
         cut = CUTS.get(board, 6)
-        passed = "통과" if (score is not None and score >= cut) else "차단"
+        media_guide = (media["images"] >= 5 or media["videos"] >= 1) and (score is None or score >= 2)
+        ok = (score is not None and score >= cut) or media_guide
+        passed = "통과(📷미디어)" if (ok and not (score is not None and score >= cut)) else ("통과" if ok else "차단")
+        m_txt = f" img{media['images']}/vid{media['videos']}" if (media['images'] or media['videos']) else ""
         print(f"[{i:2}] {score if score is not None else '??':>2}/10  {cat:<4}  "
-              f"{board_name}(컷{cut})  {passed}  | {title[:44]}")
+              f"{board_name}(컷{cut})  {passed}{m_txt}  | {title[:40]}")
         for s in summary:
             print(f"       · {s}")
 
         rows.append({**item, "board": board, "board_name": board_name, "title": title,
                      "score": score, "category": cat, "cut": cut,
-                     "passed": score is not None and score >= cut,
+                     "passed": ok, "media": media,
                      "body_len": len(body)})
         time.sleep(1)
 
@@ -173,7 +172,8 @@ def main():
     if missed:
         print(f"⚠️  놓쳤을 좋은 글 {len(missed)}건 — 8/5에 이런 글이 버려집니다:")
         for r in missed:
-            print(f"   {r['score']}/10 (컷 {r['cut']}) · 본문 {r['body_len']}자 · {r['title'][:50]}")
+            m = r.get("media", {})
+            print(f"   {r['score']}/10 (컷 {r['cut']}) · 본문 {r['body_len']}자 · img{m.get('images',0)}/vid{m.get('videos',0)} · {r['title'][:46]}")
             print(f"        {r['url']}")
         print("\n→ 조치: 컷을 낮추거나, 프롬프트의 점수 기준을 손봐야 합니다.")
     else:
