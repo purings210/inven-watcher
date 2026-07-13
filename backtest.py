@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 from inven_watcher import BOARD, CONFIG, TOPICS, claude_evaluate, fetch_post_body, http_get
 
 URLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_urls.txt")
-BACKTEST_TOPIC = "세르카"   # 또는 "배마낙원"
+BACKTEST_TOPIC = "배마낙원"   # 세르카 검증은 완료 (재현율 88%)
 
 # 운영 컷 (inven_watcher.py 와 동일하게 유지할 것)
 CUTS = {"6271": 6, "4821": 4, "5342": 5}
