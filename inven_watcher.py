@@ -481,9 +481,10 @@ def main():
 
                 cut = 0 if TEST_MODE else watch["min_score"].get(board_id, 6)
                 reco = post.get("recommend") or 0
-                # 미디어 구제: 이미지·영상 위주 공략은 텍스트 채점이 무의미하므로
-                # 점수와 무관하게 전송한다 (단, AI가 0~1점 = 완전 무관 판정이면 제외).
-                media_guide = bool(media) and (media["images"] >= 5 or media["videos"] >= 1) \
+                # 미디어 구제: 텍스트가 빈약(300자 미만)해서 AI가 내용을 못 본 글에만 적용.
+                # 텍스트가 충분한데 저점을 받은 글은 내용을 보고 내린 판정이므로 구제하지 않는다.
+                text_poor = bool(media) and len(content.get("text", "")) < 300
+                media_guide = text_poor and (media["images"] >= 5 or media["videos"] >= 1) \
                     and (ev is None or ev["score"] >= 2)
                 should = (ev is None) or ev["score"] >= cut \
                     or reco >= cfg["recommend_override"] or media_guide

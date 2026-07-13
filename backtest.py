@@ -123,7 +123,7 @@ def main():
         summary = ev["summary"] if ev else []
 
         cut = CUTS.get(board, 6)
-        media_guide = (media["images"] >= 5 or media["videos"] >= 1) and (score is None or score >= 2)
+        media_guide = len(body) < 300 and (media["images"] >= 5 or media["videos"] >= 1) and (score is None or score >= 2)
         ok = (score is not None and score >= cut) or media_guide
         passed = "통과(📷미디어)" if (ok and not (score is not None and score >= cut)) else ("통과" if ok else "차단")
         m_txt = f" img{media['images']}/vid{media['videos']}" if (media['images'] or media['videos']) else ""
